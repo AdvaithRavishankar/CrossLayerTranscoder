@@ -609,3 +609,67 @@ class CLTModel(nn.Module):
         plt.show()
 
         return result
+
+    def save_clts(self, path: str, result: Optional[Dict] = None, verbose: bool = True):
+        """
+        Save CLT weights and optionally analysis results.
+
+        Args:
+            path: Path to save the checkpoint file (.pt)
+            result: Optional analysis result dict from analyze_layer_activations
+            verbose: If True, prints save confirmation
+
+        Example:
+            >>> clt_model.train_clts(dataloader, num_epochs=10)
+            >>> result = clt_model.analyze_layer_activations(dataloader)
+            >>> clt_model.save_clts('checkpoint.pt', result=result)
+        """
+        checkpoint = {
+            'clt_state_dicts': {name: clt.state_dict() for name, clt in self._clts.items()},
+            'clt_configs': self._clt_configs,
+        }
+        if result is not None:
+            checkpoint['analysis_result'] = result
+
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+        torch.save(checkpoint, path)
+        if verbose:
+            print(f"Saved CLT checkpoint to {path}")
+
+    def load_clts(self, path: str, verbose: bool = True) -> Optional[Dict]:
+        """
+        Load CLT weights and optionally analysis results.
+
+        Args:
+            path: Path to the checkpoint file (.pt)
+            verbose: If True, prints load confirmation
+
+        Returns:
+            Analysis result dict if it was saved, otherwise None
+
+        Example:
+            >>> clt_model = CLTModel(vit)
+            >>> result = clt_model.load_clts('checkpoint.pt')
+        """
+        checkpoint = torch.load(path, weights_only=False)
+
+        # Recreate CLTs from saved configs
+        for source_layer, config in checkpoint['clt_configs'].items():
+            self.add_clt(
+                source_layer=config['source_layer'],
+                target_layer=config['target_layer'],
+                hidden_dim=config['hidden_dim'],
+                k=config['k'],
+                input_dim=config.get('input_dim'),
+                output_dim=config.get('output_dim'),
+            )
+
+        # Load state dicts
+        for name, state_dict in checkpoint['clt_state_dicts'].items():
+            if name in self._clts:
+                self._clts[name].load_state_dict(state_dict)
+
+        if verbose:
+            print(f"Loaded CLT checkpoint from {path}")
+
+        return checkpoint.get('analysis_result', None)
