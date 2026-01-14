@@ -4,7 +4,7 @@ import os
 from typing import Dict, List, Optional
 from tqdm import tqdm
 
-from .clt import CrossLayerTranscoder, CLTConfig, clt_loss
+from .clt import CrossLayerTranscoderSystem, clt_system_loss
 
 try:
     import matplotlib.pyplot as plt
@@ -17,22 +17,30 @@ class CLTModel(nn.Module):
     """
     A wrapper class for adding Cross-Layer Transcoders (CLTs) to a model for circuit tracing.
 
+    This implements the full cross-layer architecture from Anthropic's paper where:
+    - Each layer l has features that read from the residual stream at layer l
+    - Features from layer l can write to ALL subsequent layers l, l+1, ..., L
+    - Output at layer l: y_hat^l = Σ_{l'=1}^{l} W_dec^{l'→ℓ} a^{l'}
+
     Args:
         model: (nn.Module) The model to wrap
 
     Example:
         >>> clt_model = CLTModel(vit_model)
-        >>> clt_model.add_all_clts(hidden_dim=4096, k=64)
+        >>> clt_model.add_clt_system(hidden_dim=4096, k=64)
         >>> clt_model.train_clts(dataloader, num_epochs=10)
     """
 
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-        self._clts: Dict[str, CrossLayerTranscoder] = {}
-        self._clt_activations: Dict[str, Dict[str, torch.Tensor]] = {}
-        self._clt_configs: Dict[str, Dict] = {}
-        self._handles: Dict[str, torch.utils.hooks.RemovableHandle] = {}
+        self._clt_system: Optional[CrossLayerTranscoderSystem] = None
+        self._layer_names: List[str] = []
+        self._residual_activations: Dict[str, torch.Tensor] = {}
+        self._mlp_outputs: Dict[str, torch.Tensor] = {}
+        self._clt_features: List[torch.Tensor] = []
+        self._handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._config: Dict = {}
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
@@ -107,147 +115,118 @@ class CLTModel(nn.Module):
         return clt_layers
 
     def __repr__(self) -> str:
-        num_clts = len(self._clts)
-        return f"CLTModel(model={self.model.__class__.__name__}, num_clts={num_clts})"
+        has_clt = self._clt_system is not None
+        num_layers = len(self._layer_names) if has_clt else 0
+        return f"CLTModel(model={self.model.__class__.__name__}, num_layers={num_layers}, has_clt={has_clt})"
 
     # ==================== CLT Methods ====================
 
-    def add_clt(
-        self,
-        source_layer: str,
-        target_layer: str,
-        hidden_dim: int,
-        k: int = 64,
-        clt: Optional[CrossLayerTranscoder] = None
-    ) -> CrossLayerTranscoder:
-        """
-        Add a Cross-Layer Transcoder between two layers for circuit tracing.
-
-        Args:
-            source_layer: Name of the layer to read activations from
-            target_layer: Name of the layer whose activations we predict
-            hidden_dim: Dimension of sparse feature space
-            k: Top-k sparsity (number of active features)
-            clt: Pre-trained CLT to use. If None, creates a new one.
-
-        Returns:
-            The CrossLayerTranscoder instance
-        """
-        # Get dimensions from layers
-        source_module = self.get_layer(source_layer)
-        target_module = self.get_layer(target_layer)
-
-        # Infer dimensions
-        source_dim = self._get_output_dim(source_module)
-        target_dim = self._get_input_dim(target_module)
-
-        # Create or use provided CLT
-        if clt is None:
-            config = CLTConfig(
-                input_dim=source_dim,
-                hidden_dim=hidden_dim,
-                output_dim=target_dim,
-                num_layers=1,
-                k=k
-            )
-            clt = CrossLayerTranscoder(config)
-
-        # Store CLT and config
-        self._clts[source_layer] = clt
-        self._clt_configs[source_layer] = {
-            'source_layer': source_layer,
-            'target_layer': target_layer,
-            'hidden_dim': hidden_dim,
-            'k': k,
-            'input_dim': source_dim,
-            'output_dim': target_dim
-        }
-        self._clt_activations[source_layer] = {}
-
-        # Register hook on source layer to capture activations and run CLT
-        def source_hook(module, input, output):
-            act = output
-            if act.dim() == 4:  # Conv output: (B, C, H, W)
-                act = act.permute(0, 2, 3, 1)  # -> (B, H, W, C)
-
-            self._clt_activations[source_layer]['source'] = act.detach()
-
-            # Run CLT
-            clt_out, features, indices = clt(act, return_features=True)
-            self._clt_activations[source_layer]['features'] = features.detach() if features is not None else None
-            self._clt_activations[source_layer]['clt_output'] = clt_out.detach()
-
-            return output
-
-        # Register hook on target layer to capture target activations
-        def target_hook(module, input):
-            inp = input[0] if isinstance(input, tuple) else input
-            if inp.dim() == 4:
-                inp = inp.permute(0, 2, 3, 1)
-            self._clt_activations[source_layer]['target'] = inp.detach()
-            return input
-
-        # Add hooks
-        source_handle = source_module.register_forward_hook(source_hook)
-        self._handles[source_layer] = source_handle
-
-        target_handle = target_module.register_forward_pre_hook(target_hook)
-        self._handles[f"{source_layer}_target"] = target_handle
-
-        return clt
-
-    def add_all_clts(
+    def add_clt_system(
         self,
         hidden_dim: int = 4096,
         k: int = 64,
         device: Optional[torch.device] = None,
         verbose: bool = True
-    ) -> Dict[str, CrossLayerTranscoder]:
+    ) -> CrossLayerTranscoderSystem:
         """
-        Add CLTs between all adjacent layers identified by list_clt_layers().
+        Add a Cross-Layer Transcoder system spanning all MLP layers.
+
+        This creates the full cross-layer architecture where features from each
+        layer can contribute to reconstructing outputs at all subsequent layers.
 
         Args:
-            hidden_dim: Dimension of sparse feature space for all CLTs
-            k: Top-k sparsity (number of active features)
-            device: Device to place CLTs on. If None, uses model's device.
+            hidden_dim: Dimension of sparse feature space
+            k: Top-k sparsity (number of active features per layer)
+            device: Device to place CLT on. If None, uses model's device.
             verbose: If True, prints progress
 
         Returns:
-            Dictionary mapping source layer names to their CLTs
+            The CrossLayerTranscoderSystem instance
         """
-        layers = self.list_clt_layers()
-        if len(layers) < 2:
-            raise ValueError(f"Need at least 2 layers for CLT, found {len(layers)}")
+        # Clear any existing CLT system
+        self.clear_clts()
+
+        self._layer_names = self.list_clt_layers()
+        num_layers = len(self._layer_names)
+
+        if num_layers < 2:
+            raise ValueError(f"Need at least 2 layers for CLT, found {num_layers}")
 
         if verbose:
-            print(f"Found {len(layers)} layers, creating {len(layers) - 1} CLTs")
+            print(f"Found {num_layers} MLP layers for CLT system")
 
         if device is None:
             device = next(self.model.parameters()).device
 
-        # Clear any existing CLTs
-        self.clear_clts()
-        print("="*40)
-        print("ADDING Cross Layer Transcoders (CLT)")
-        print("="*40)
-        # Create CLTs between adjacent layers
-        for i in range(len(layers) - 1):
-            source_layer = layers[i]
-            target_layer = layers[i + 1]
-            clt = self.add_clt(
-                source_layer=source_layer,
-                target_layer=target_layer,
-                hidden_dim=hidden_dim,
-                k=k
-            )
-            clt.to(device)
-            if verbose:
-                print(f"  Created CLT: {source_layer} -> {target_layer}")
+        # Get dimensions from first MLP layer
+        first_mlp = self.get_layer(self._layer_names[0])
+        input_dim = self._get_input_dim(first_mlp)
+        output_dim = self._get_output_dim(first_mlp)
 
-        print("="*40)
+        # Create the cross-layer transcoder system
+        self._clt_system = CrossLayerTranscoderSystem(
+            num_layers=num_layers,
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            k=k
+        )
+        self._clt_system.to(device)
+
+        self._config = {
+            'num_layers': num_layers,
+            'input_dim': input_dim,
+            'hidden_dim': hidden_dim,
+            'output_dim': output_dim,
+            'k': k
+        }
+
+        # Register hooks to capture residual stream and MLP outputs
+        self._register_hooks()
+
+        print("=" * 40)
+        print("ADDING Cross Layer Transcoder System")
+        print("=" * 40)
+        if verbose:
+            for i, name in enumerate(self._layer_names):
+                print(f"  Layer {i}: {name}")
+            print(f"\nArchitecture:")
+            print(f"  - {num_layers} encoders (one per layer)")
+            print(f"  - {num_layers * (num_layers + 1) // 2} decoders (cross-layer connections)")
+            print(f"  - Hidden dim: {hidden_dim}, Top-k: {k}")
+        print("=" * 40)
         print()
 
-        return self._clts
+        return self._clt_system
+
+    def _register_hooks(self):
+        """Register forward hooks to capture activations."""
+        for layer_idx, layer_name in enumerate(self._layer_names):
+            mlp_module = self.get_layer(layer_name)
+
+            # Hook to capture input to MLP (residual stream)
+            def make_pre_hook(idx, name):
+                def hook(module, input):
+                    inp = input[0] if isinstance(input, tuple) else input
+                    if inp.dim() == 4:  # Conv output: (B, C, H, W)
+                        inp = inp.permute(0, 2, 3, 1)  # -> (B, H, W, C)
+                    self._residual_activations[name] = inp.detach()
+                    return input
+                return hook
+
+            # Hook to capture output of MLP
+            def make_post_hook(idx, name):
+                def hook(module, input, output):
+                    out = output
+                    if out.dim() == 4:
+                        out = out.permute(0, 2, 3, 1)
+                    self._mlp_outputs[name] = out.detach()
+                    return output
+                return hook
+
+            pre_handle = mlp_module.register_forward_pre_hook(make_pre_hook(layer_idx, layer_name))
+            post_handle = mlp_module.register_forward_hook(make_post_hook(layer_idx, layer_name))
+            self._handles.extend([pre_handle, post_handle])
 
     def train_clts(
         self,
@@ -255,66 +234,67 @@ class CLTModel(nn.Module):
         num_epochs: int = 10,
         lr: float = 1e-3,
         l1_coef: float = 1e-3,
+        sparsity_c: float = 1.0,
         device: Optional[torch.device] = None,
         verbose: bool = True
     ) -> Dict[str, List[float]]:
         """
-        Train all CLTs using the provided dataloader.
+        Train the CLT system using the provided dataloader.
 
         Args:
             dataloader: DataLoader providing input batches for training.
             num_epochs: Number of training epochs
             lr: Learning rate for optimizer
-            l1_coef: L1 sparsity coefficient for loss
+            l1_coef: λ coefficient for sparsity penalty
+            sparsity_c: c hyperparameter in tanh(c * ||W_dec|| * a)
             device: Device to train on. If None, uses model's device.
             verbose: If True, prints training progress
 
         Returns:
-            Dictionary mapping source layer names to their loss history
+            Dictionary with loss history
         """
-        if not self._clts:
-            raise ValueError("No CLTs added. Call add_all_clts() first.")
+        if self._clt_system is None:
+            raise ValueError("No CLT system added. Call add_clt_system() first.")
 
         if device is None:
             device = next(self.model.parameters()).device
 
-        # Freeze base model parameters (only train CLTs)
+        # Freeze base model parameters (only train CLT)
         for param in self.model.parameters():
             param.requires_grad = False
 
         print("Freezing base model's weights for CLT training")
 
-        # Create optimizer for all CLT parameters
-        all_clt_params = []
-        for clt in self._clts.values():
-            all_clt_params.extend(clt.parameters())
-        optimizer = torch.optim.Adam(all_clt_params, lr=lr)
+        # Create optimizer for CLT parameters
+        optimizer = torch.optim.Adam(self._clt_system.parameters(), lr=lr)
 
-        # Training loop
-        self.model.eval()  # Keep base model frozen
-        for clt in self._clts.values():
-            clt.train()
-
-        total_clt_params = sum(p.numel() for p in all_clt_params)
-
+        total_clt_params = sum(p.numel() for p in self._clt_system.parameters())
         print(f"Set Optimizer for CLT parameters. Total number of CLT params: {total_clt_params}")
         print(f"Training on {device}")
         print()
 
-        loss_history = {layer: [] for layer in self._clts.keys()}
+        # Training loop
+        self.model.eval()
+        self._clt_system.train()
 
-        print("="*40)
-        print("Training CLTs")
-        print("="*40)
+        loss_history = {
+            'total': [],
+            'reconstruction': [],
+            'sparsity': []
+        }
+
+        print("=" * 40)
+        print("Training CLT System")
+        print("=" * 40)
         print()
-        
+
         for epoch in range(num_epochs):
             total_epoch_loss = 0.0
             num_batches = 0
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", disable=not verbose)
             for batch in pbar:
-                # Handle different batch formats
+                # Forward pass through base model to capture activations
                 if isinstance(batch, dict):
                     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
@@ -329,88 +309,100 @@ class CLTModel(nn.Module):
                     with torch.no_grad():
                         _ = self.model(batch)
 
-                # Compute loss for each CLT
+                # Gather residual stream inputs for each layer
+                layer_inputs = [
+                    self._residual_activations[name]
+                    for name in self._layer_names
+                ]
+
+                # Gather MLP output targets for each layer
+                targets = [
+                    self._mlp_outputs[name]
+                    for name in self._layer_names
+                ]
+
+                # Forward through CLT system
                 optimizer.zero_grad()
-                batch_loss = 0.0
+                result = self._clt_system(layer_inputs, return_features=True)
+                outputs = result['outputs']
+                all_features = result['features']
 
-                for source_layer, clt in self._clts.items():
-                    source_act = self.get_clt_activations(source_layer, "source")
-                    target_act = self.get_clt_activations(source_layer, "target")
+                # Store features for analysis
+                self._clt_features = [f.detach() for f in all_features]
 
-                    if source_act is None or target_act is None:
-                        continue
-
-                    # Forward through CLT
-                    clt_output, features, _ = clt(source_act, return_features=True)
-
-                    # Compute loss
-                    loss, _ = clt_loss(
-                        clt_output, target_act, features,
-                        l1_coef=l1_coef
-                    )
-
-                    batch_loss += loss
-                    loss_history[source_layer].append(loss.item())
+                # Compute loss
+                loss, loss_dict = clt_system_loss(
+                    outputs, targets, all_features,
+                    self._clt_system,
+                    l1_coef=l1_coef,
+                    sparsity_c=sparsity_c
+                )
 
                 # Backward and optimize
-                if batch_loss > 0:
-                    batch_loss.backward()
-                    optimizer.step()
-                    total_epoch_loss += batch_loss.item()
-                    num_batches += 1
-                    pbar.set_postfix(loss=f"{batch_loss.item():.6f}")
+                loss.backward()
+                optimizer.step()
 
-        # Set CLTs to eval mode
-        for clt in self._clts.values():
-            clt.eval()
+                total_epoch_loss += loss.item()
+                num_batches += 1
+
+                loss_history['total'].append(loss_dict['total'].item())
+                loss_history['reconstruction'].append(loss_dict['reconstruction'].item())
+                loss_history['sparsity'].append(loss_dict['sparsity'].item())
+
+                pbar.set_postfix(loss=f"{loss.item():.6f}")
+
+        # Set CLT to eval mode
+        self._clt_system.eval()
 
         if verbose:
             print("Training complete!")
 
         return loss_history
 
-    def get_clt(self, source_layer: str) -> Optional[CrossLayerTranscoder]:
-        """Get the CLT associated with a source layer."""
-        return self._clts.get(source_layer)
+    def get_clt_system(self) -> Optional[CrossLayerTranscoderSystem]:
+        """Get the CLT system."""
+        return self._clt_system
 
     def get_clt_activations(
         self,
-        source_layer: str,
+        layer_idx: int,
         activation_type: str = "features"
     ) -> Optional[torch.Tensor]:
         """
-        Get stored activations from a CLT.
+        Get stored activations from the CLT system.
 
         Args:
-            source_layer: The source layer name used when adding the CLT
-            activation_type: One of "source", "target", "features", "clt_output"
+            layer_idx: The layer index (0-indexed)
+            activation_type: One of "residual", "mlp_output", "features"
 
         Returns:
             The requested activation tensor, or None if not available
         """
-        layer_acts = self._clt_activations.get(source_layer, {})
-        return layer_acts.get(activation_type)
+        if layer_idx >= len(self._layer_names):
+            return None
 
-    def remove_clt(self, source_layer: str) -> None:
-        """Remove a CLT and its associated hooks."""
-        if source_layer in self._clts:
-            # Remove hooks
-            if source_layer in self._handles:
-                self._handles[source_layer].remove()
-                del self._handles[source_layer]
-            target_key = f"{source_layer}_target"
-            if target_key in self._handles:
-                self._handles[target_key].remove()
-                del self._handles[target_key]
+        layer_name = self._layer_names[layer_idx]
 
-            del self._clts[source_layer]
-            del self._clt_configs[source_layer]
-            del self._clt_activations[source_layer]
+        if activation_type == "residual":
+            return self._residual_activations.get(layer_name)
+        elif activation_type == "mlp_output":
+            return self._mlp_outputs.get(layer_name)
+        elif activation_type == "features":
+            if layer_idx < len(self._clt_features):
+                return self._clt_features[layer_idx]
+        return None
 
     def clear_clts(self) -> None:
-        """Remove all CLTs."""
-        for source_layer in list(self._clts.keys()):
-            self.remove_clt(source_layer)
+        """Remove the CLT system and hooks."""
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        self._clt_system = None
+        self._layer_names = []
+        self._residual_activations = {}
+        self._mlp_outputs = {}
+        self._clt_features = []
+        self._config = {}
 
     def _get_output_dim(self, module: nn.Module) -> int:
         """Infer output dimension of a module."""
@@ -424,6 +416,8 @@ class CLTModel(nn.Module):
             return module.hidden_size
         elif hasattr(module, 'dense') and hasattr(module.dense, 'out_features'):
             return module.dense.out_features
+        elif hasattr(module, 'fc2') and hasattr(module.fc2, 'out_features'):
+            return module.fc2.out_features
         else:
             for child in module.children():
                 if isinstance(child, nn.Linear):
@@ -442,6 +436,8 @@ class CLTModel(nn.Module):
             return module.hidden_size
         elif hasattr(module, 'dense') and hasattr(module.dense, 'in_features'):
             return module.dense.in_features
+        elif hasattr(module, 'fc1') and hasattr(module.fc1, 'in_features'):
+            return module.fc1.in_features
         else:
             for child in module.children():
                 if isinstance(child, nn.Linear):
@@ -472,17 +468,15 @@ class CLTModel(nn.Module):
                 - 'peak_layers': Tensor of shape (num_samples,) where each value is the
                   layer index with the highest activation for that sample
         """
-        if not self._clts:
-            raise ValueError("No CLTs added. Call add_all_clts() first.")
+        if self._clt_system is None:
+            raise ValueError("No CLT system added. Call add_clt_system() first.")
 
         if device is None:
             device = next(self.model.parameters()).device
 
         self.model.eval()
-        for clt in self._clts.values():
-            clt.eval()
+        self._clt_system.eval()
 
-        layer_names = list(self._clts.keys())
         all_activations = []
 
         with torch.no_grad():
@@ -499,23 +493,25 @@ class CLTModel(nn.Module):
                     batch = batch.to(device)
                     _ = self.model(batch)
 
+                # Forward through CLT to get features
+                layer_inputs = [
+                    self._residual_activations[name]
+                    for name in self._layer_names
+                ]
+                result = self._clt_system(layer_inputs, return_features=True)
+                all_features = result['features']
+
                 # Collect activation magnitudes for each layer
-                batch_size = batch[0].shape[0] if isinstance(batch, (list, tuple)) else \
-                            batch['pixel_values'].shape[0] if isinstance(batch, dict) and 'pixel_values' in batch else \
-                            batch.shape[0]
+                batch_size = all_features[0].shape[0]
+                batch_activations = torch.zeros(batch_size, len(self._layer_names))
 
-                batch_activations = torch.zeros(batch_size, len(layer_names))
-
-                for layer_idx, source_layer in enumerate(layer_names):
-                    features = self.get_clt_activations(source_layer, "features")
-                    if features is not None:
-                        # Mean activation magnitude per sample
-                        # features shape: (batch, seq_len, hidden_dim) or (batch, hidden_dim)
-                        if features.dim() == 3:
-                            act_magnitude = features.abs().mean(dim=(1, 2))  # (batch,)
-                        else:
-                            act_magnitude = features.abs().mean(dim=1)  # (batch,)
-                        batch_activations[:, layer_idx] = act_magnitude.cpu()
+                for layer_idx, features in enumerate(all_features):
+                    # Mean activation magnitude per sample
+                    if features.dim() == 3:
+                        act_magnitude = features.abs().mean(dim=(1, 2))
+                    else:
+                        act_magnitude = features.abs().mean(dim=1)
+                    batch_activations[:, layer_idx] = act_magnitude.cpu()
 
                 all_activations.append(batch_activations)
 
@@ -523,16 +519,14 @@ class CLTModel(nn.Module):
                     print(f"Processed {batch_idx + 1} batches")
 
         activations = torch.cat(all_activations, dim=0)
-
-        # Compute peak layer for each sample (index of layer with max activation)
-        peak_layers = activations.argmax(dim=1)  # (num_samples,)
+        peak_layers = activations.argmax(dim=1)
 
         if verbose:
-            print(f"Analyzed {activations.shape[0]} samples across {len(layer_names)} layers")
+            print(f"Analyzed {activations.shape[0]} samples across {len(self._layer_names)} layers")
 
         return {
             'activations': activations,
-            'layer_names': layer_names,
+            'layer_names': self._layer_names,
             'peak_layers': peak_layers
         }
 
@@ -561,12 +555,9 @@ class CLTModel(nn.Module):
             Dictionary containing activation data (same as analyze_layer_activations)
 
         Example:
-            >>> clt_model.add_all_clts(hidden_dim=4096, k=64)
+            >>> clt_model.add_clt_system(hidden_dim=4096, k=64)
             >>> clt_model.train_clts(train_loader, num_epochs=10)
             >>> clt_model.plot_layer_activation_histogram(val_loader, "outputs/activations.png")
-            >>> # Or with pre-computed result:
-            >>> result = clt_model.analyze_layer_activations(val_loader)
-            >>> clt_model.plot_layer_activation_histogram(result=result, output_path="activations.png")
         """
         if not MATPLOTLIB_AVAILABLE:
             raise ImportError("Matplotlib is required. Install with: pip install matplotlib")
@@ -576,6 +567,7 @@ class CLTModel(nn.Module):
             if dataloader is None:
                 raise ValueError("Either dataloader or result must be provided")
             result = self.analyze_layer_activations(dataloader, device, verbose)
+
         activations = result['activations']
         layer_names = result['layer_names']
 
@@ -642,9 +634,13 @@ class CLTModel(nn.Module):
             >>> result = clt_model.analyze_layer_activations(dataloader)
             >>> clt_model.save_clts('checkpoint.pt', result=result)
         """
+        if self._clt_system is None:
+            raise ValueError("No CLT system to save. Call add_clt_system() first.")
+
         checkpoint = {
-            'clt_state_dicts': {name: clt.state_dict() for name, clt in self._clts.items()},
-            'clt_configs': self._clt_configs,
+            'clt_state_dict': self._clt_system.state_dict(),
+            'config': self._config,
+            'layer_names': self._layer_names,
         }
         if result is not None:
             checkpoint['analysis_result'] = result
@@ -671,19 +667,25 @@ class CLTModel(nn.Module):
         """
         checkpoint = torch.load(path, weights_only=False)
 
-        # Recreate CLTs from saved configs
-        for source_layer, config in checkpoint['clt_configs'].items():
-            self.add_clt(
-                source_layer=config['source_layer'],
-                target_layer=config['target_layer'],
-                hidden_dim=config['hidden_dim'],
-                k=config['k'],
-            )
+        # Recreate CLT system from config
+        config = checkpoint['config']
+        self._layer_names = checkpoint['layer_names']
 
-        # Load state dicts
-        for name, state_dict in checkpoint['clt_state_dicts'].items():
-            if name in self._clts:
-                self._clts[name].load_state_dict(state_dict)
+        device = next(self.model.parameters()).device
+
+        self._clt_system = CrossLayerTranscoderSystem(
+            num_layers=config['num_layers'],
+            input_dim=config['input_dim'],
+            hidden_dim=config['hidden_dim'],
+            output_dim=config['output_dim'],
+            k=config['k']
+        )
+        self._clt_system.load_state_dict(checkpoint['clt_state_dict'])
+        self._clt_system.to(device)
+        self._config = config
+
+        # Re-register hooks
+        self._register_hooks()
 
         if verbose:
             print(f"Loaded CLT checkpoint from {path}")
