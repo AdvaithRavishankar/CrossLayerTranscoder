@@ -156,7 +156,11 @@ class CLTModel(nn.Module):
         self._clts[source_layer] = clt
         self._clt_configs[source_layer] = {
             'source_layer': source_layer,
-            'target_layer': target_layer
+            'target_layer': target_layer,
+            'hidden_dim': hidden_dim,
+            'k': k,
+            'input_dim': source_dim,
+            'output_dim': target_dim
         }
         self._clt_activations[source_layer] = {}
 
@@ -534,21 +538,24 @@ class CLTModel(nn.Module):
 
     def plot_layer_activation_histogram(
         self,
-        dataloader: torch.utils.data.DataLoader,
+        dataloader: torch.utils.data.DataLoader = None,
         output_path: Optional[str] = None,
         device: Optional[torch.device] = None,
         figsize: tuple = (12, 6),
-        verbose: bool = True
+        verbose: bool = True,
+        result: Optional[Dict[str, torch.Tensor]] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Plot a histogram showing which layers are most activated across the dataset.
 
         Args:
-            dataloader: DataLoader providing input batches
+            dataloader: DataLoader providing input batches. Not needed if result is provided.
             output_path: Path to save the figure. If None, displays interactively.
             device: Device to run on. If None, uses model's device.
             figsize: Figure size as (width, height)
             verbose: If True, prints progress
+            result: Pre-computed result from analyze_layer_activations or load_clts.
+                    If provided, skips recomputation and uses this data directly.
 
         Returns:
             Dictionary containing activation data (same as analyze_layer_activations)
@@ -557,12 +564,18 @@ class CLTModel(nn.Module):
             >>> clt_model.add_all_clts(hidden_dim=4096, k=64)
             >>> clt_model.train_clts(train_loader, num_epochs=10)
             >>> clt_model.plot_layer_activation_histogram(val_loader, "outputs/activations.png")
+            >>> # Or with pre-computed result:
+            >>> result = clt_model.analyze_layer_activations(val_loader)
+            >>> clt_model.plot_layer_activation_histogram(result=result, output_path="activations.png")
         """
         if not MATPLOTLIB_AVAILABLE:
             raise ImportError("Matplotlib is required. Install with: pip install matplotlib")
 
-        # Analyze activations
-        result = self.analyze_layer_activations(dataloader, device, verbose)
+        # Use pre-computed result or analyze activations
+        if result is None:
+            if dataloader is None:
+                raise ValueError("Either dataloader or result must be provided")
+            result = self.analyze_layer_activations(dataloader, device, verbose)
         activations = result['activations']
         layer_names = result['layer_names']
 
@@ -588,7 +601,12 @@ class CLTModel(nn.Module):
 
         # Heatmap of activations per sample (subsample if too many)
         ax2 = axes[1]
-        plot_activations = activations.numpy()
+        max_samples = 100
+        if activations.shape[0] > max_samples:
+            indices = torch.linspace(0, activations.shape[0] - 1, max_samples).long()
+            plot_activations = activations[indices].numpy()
+        else:
+            plot_activations = activations.numpy()
 
         im = ax2.imshow(plot_activations.T, aspect='auto', cmap='viridis')
         ax2.set_xlabel('Sample Index')
@@ -660,8 +678,6 @@ class CLTModel(nn.Module):
                 target_layer=config['target_layer'],
                 hidden_dim=config['hidden_dim'],
                 k=config['k'],
-                input_dim=config.get('input_dim'),
-                output_dim=config.get('output_dim'),
             )
 
         # Load state dicts
