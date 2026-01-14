@@ -588,12 +588,7 @@ class CLTModel(nn.Module):
 
         # Heatmap of activations per sample (subsample if too many)
         ax2 = axes[1]
-        max_samples = 100
-        if activations.shape[0] > max_samples:
-            indices = torch.linspace(0, activations.shape[0] - 1, max_samples).long()
-            plot_activations = activations[indices].numpy()
-        else:
-            plot_activations = activations.numpy()
+        plot_activations = activations.numpy()
 
         im = ax2.imshow(plot_activations.T, aspect='auto', cmap='viridis')
         ax2.set_xlabel('Sample Index')
