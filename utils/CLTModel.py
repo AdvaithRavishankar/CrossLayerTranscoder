@@ -465,6 +465,8 @@ class CLTModel(nn.Module):
             Dictionary with:
                 - 'activations': Tensor of shape (num_samples, num_layers)
                 - 'layer_names': List of layer names
+                - 'peak_layers': Tensor of shape (num_samples,) where each value is the
+                  layer index with the highest activation for that sample
         """
         if not self._clts:
             raise ValueError("No CLTs added. Call add_all_clts() first.")
@@ -518,12 +520,16 @@ class CLTModel(nn.Module):
 
         activations = torch.cat(all_activations, dim=0)
 
+        # Compute peak layer for each sample (index of layer with max activation)
+        peak_layers = activations.argmax(dim=1)  # (num_samples,)
+
         if verbose:
             print(f"Analyzed {activations.shape[0]} samples across {len(layer_names)} layers")
 
         return {
             'activations': activations,
-            'layer_names': layer_names
+            'layer_names': layer_names,
+            'peak_layers': peak_layers
         }
 
     def plot_layer_activation_histogram(
