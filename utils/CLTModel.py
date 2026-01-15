@@ -280,7 +280,8 @@ class CLTModel(nn.Module):
         loss_history = {
             'total': [],
             'reconstruction': [],
-            'sparsity': []
+            'sparsity': [],
+            'epoch_total': []
         }
 
         print("=" * 40)
@@ -321,6 +322,11 @@ class CLTModel(nn.Module):
                     for name in self._layer_names
                 ]
 
+                # ---- FIX DTYPE MISMATCH (bf16 activations vs fp32 CLT) ----
+                layer_inputs = [x.float() for x in layer_inputs]
+                targets = [t.float() for t in targets]
+
+
                 # Forward through CLT system
                 optimizer.zero_grad()
                 result = self._clt_system(layer_inputs, return_features=True)
@@ -350,6 +356,12 @@ class CLTModel(nn.Module):
                 loss_history['sparsity'].append(loss_dict['sparsity'].item())
 
                 pbar.set_postfix(loss=f"{loss.item():.6f}")
+            #  epoch logging 
+            avg_epoch_loss = total_epoch_loss / max(1, num_batches)
+            loss_history['epoch_total'].append(avg_epoch_loss)
+
+            if verbose:
+                print(f"Epoch {epoch + 1}/{num_epochs} avg total loss: {avg_epoch_loss:.6f}")
 
         # Set CLT to eval mode
         self._clt_system.eval()
@@ -498,6 +510,9 @@ class CLTModel(nn.Module):
                     self._residual_activations[name]
                     for name in self._layer_names
                 ]
+
+                layer_inputs = [x.float() for x in layer_inputs]
+
                 result = self._clt_system(layer_inputs, return_features=True)
                 all_features = result['features']
 
